@@ -100,65 +100,13 @@ uint64_t morton64(float x, float y, float z)
     return (mortonEncode_magicbits((unsigned int)x, (unsigned int)y, (unsigned int)z));
 }
 
-/*
-    Prep bodies for sorting by caching morton codes. Wish this didn't involve so much copying.
-*/
-
-typedef struct s_mortkit
+uint64_t mortonize(cl_float4 pos, t_bounds bounds)
 {
-    //t_body *bodies;
-    cl_float4 *positions;
-    cl_float4 *velocities;
-    t_sortbod *sorts;
-    t_bounds bounds;
-    int count;
-}               t_mortkit;
-
-// typedef struct          s_sortbod
-// {
-//     cl_float4           pos;
-//     cl_float4           vel;
-//     uint64_t            morton;
-// }                       t_sortbod;
-
-void *mort_thread(void *param)
-{
-    t_mortkit *kit = (t_mortkit *)param;
-    float distance =  1.0 / (kit->bounds.xmax - kit->bounds.xmin);
-    for (int i = 0; i < kit->count; i++)
-    {
-        kit->sorts[i].morton = morton64((kit->positions[i].x - kit->bounds.xmin) * distance, (kit->positions[i].y - kit->bounds.ymin) * distance, (kit->positions[i].z - kit->bounds.zmin) * distance);
-        kit->sorts[i].pos = kit->positions[i];
-        kit->sorts[i].vel = kit->velocities[i];
-    }
-    free(kit);
-    return (0);
+    float distance =  1.0 / (bounds.xmax - bounds.xmin);
+    return morton64((pos.x - bounds.xmin) * distance, (pos.y - bounds.ymin) * distance, (pos.z - bounds.zmin) * distance);
 }
 
-t_sortbod *mt_make_sortbods(t_dataset *data, t_bounds bounds)
-{
-    int bpt = ceil((float)data->particle_cnt / THREADCOUNT);
-    int count = data->particle_cnt;
-    //printf("count starts at %d\n", count);
-    pthread_t *mortoners = calloc(THREADCOUNT, sizeof(pthread_t));
-    t_sortbod *sorts = calloc(data->particle_cnt, sizeof(t_sortbod));
-    for (int i = 0; i < THREADCOUNT; i++)
-    {
-        t_mortkit *kit = calloc(1, sizeof(t_mortkit));
-        kit->bounds = bounds;
-        kit->count = bpt < count ? bpt : count;
-        //printf("kit max set to %d, i*bpt %d\n", kit->count, i * bpt);
-        kit->positions = &(data->positions[i * bpt]);
-        kit->velocities = &(data->velocities[i * bpt]);
-        kit->sorts = &(sorts[i * bpt]);
-        count -= bpt;
-        pthread_create(&mortoners[i], NULL, mort_thread, kit);
-    }
-    for (int i = 0; i < THREADCOUNT; i++)
-        pthread_join(mortoners[i], NULL);
-    free(mortoners);
-    return (sorts);
-}
+///Center of gravity calculations///
 
 static cl_float4 vadd(cl_float4 a, cl_float4 b)
 {
@@ -412,70 +360,6 @@ static t_tree **assemble_better(t_tree *cell, t_tree *root)
     return ret;
 }
 
-static t_tree **assemble_neighborhood(t_tree *cell, t_tree *root)
-{
-    t_tree **ret;
-    t_tree ***returned;
-
-    /*
-        recursively flow through the tree, determining if cells are near or far from
-        the cell we're currently considering. We skip the root.
-        
-        If the cell is far away (m_a_c < THETA), that cell is far enough away to treat as 1 particle.
-        we create a copy of it as 1 particle and add that to the neighborhood.
-        
-        if the cell is nearby and childless (ie leaf), it is near enough that direct calculation is necessary,
-        so it returns a null-terminated array just containing a pointer to the cell.
-
-        if the cell is nearby and has children, we recurse down to its children.
-        we make space for the 8 arrays that will be returned (some might be null)
-        then we copy them into one final array and return it.
-
-        in this way, we enumerate the "Neighborhood" of the cell, ie the bodies we'll need to compare with on the GPU.
-    */
-    if (root->parent && multipole_acceptance_criterion(cell, root) < THETA)
-    {
-        ret = (t_tree **)calloc(2, sizeof(t_tree *));
-        ret[0] = root->as_single;
-        ret[1] = NULL;
-        return (ret);
-    }
-    else if (!(root->children))
-    {
-        ret = (t_tree **)calloc(2, sizeof(t_tree *));
-        ret[0] = root;
-        ret[1] = NULL;
-        return (ret);
-    }
-    else
-    {
-        returned = (t_tree ***)calloc(8, sizeof(t_tree **));
-        int total = 0;
-        for (int i = 0; i < 8; i++)
-        {
-            returned[i] = assemble_neighborhood(cell, root->children[i]);
-            total += count_tree_array(returned[i]);
-        }
-        ret = (t_tree **)calloc(total + 1, sizeof(t_tree *));
-        for (int i = 0; i < total;)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                if (!returned[j])
-                    continue ;
-                for (int k = 0; returned[j][k]; k++, i++)
-                {
-                    ret[i] = returned[j][k];
-                }
-                free(returned[j]);
-            }
-            free(returned);
-        }
-        ret[total] = NULL;
-        return (ret);
-    }
-}
-
 size_t nearest_256(size_t n)
 {
     return (((n / 256) + 1) * 256);
@@ -645,36 +529,57 @@ t_bounds bounds_from_code(t_bounds parent, unsigned int code)
     return (bounds);
 }
 
-int binary_border_search(uint64_t *mortons, int startind, int maxind, unsigned int code, int depth)
+unsigned int mask(uint64_t mort, int depth)
 {
-    if (startind == maxind)
-        return 0;//empty cell at end of parent
-    uint64_t m = mortons[startind];
-    m = m << (1 + 3 * depth);
-    m = m >> 61;
-    if (m != code)
-        return 0; // empty cell.
-    int step = (maxind - startind) / 2;
-    int i = startind;
-    while (i < maxind - 1)
+    mort = mort << (1 + 3 * depth);
+    mort = mort >> 61;
+    return (unsigned int)mort;
+}
+
+void new_split(t_tree *node)
+{
+    int depth = node_depth(node);
+
+    int *counts = calloc(8, sizeof(int));
+    for (int i = 0; i < node->count; i++)
+        counts[mask(node->mortons[i], depth)]++;
+    int *spots = calloc(8, sizeof(int));
+    for (int i = 1; i < 8; i++)
+        spots[i] = spots[i - 1] + counts[i - 1];
+    //this should offer some pretty substantial speedup so i think it's ok to be aggressive with memory
+    cl_float4 *pos_new = calloc(node->count, sizeof(cl_float4));
+    cl_float4 *vel_new = calloc(node->count, sizeof(cl_float4));
+    uint64_t *mort_new = calloc(node->count, sizeof(uint64_t));
+    for (int i = 0; i < node->count; i++)
     {
-        m = mortons[i];
-        m = m << (1 + 3 * depth);
-        m = m >> 61;
-        uint64_t mnext = mortons[i + 1];
-        mnext = mnext << (1 + 3 * depth);
-        mnext = mnext >> 61;
-        if (m == code && mnext != code)
-            return (i - startind + 1); //found border
-        else if (m == code)
-            i += step;//step forward
-        else
-            i -= step;//step backward
-        step /= 2;
-        if (step == 0)
-            step = 1;
+        int new_ind = spots[mask(node->mortons[i], depth)]++;
+        pos_new[new_ind] = node->positions[i];
+        vel_new[new_ind] = node->velocities[i];
+        mort_new[new_ind] = node->mortons[i]; //we could save some shifts by discarding the left parts of mortons, try later
     }
-    return (maxind - startind);
+    memcpy(node->positions, pos_new, node->count * sizeof(cl_float4));
+    free(pos_new);
+    memcpy(node->velocities, vel_new, node->count * sizeof(cl_float4));
+    free(vel_new);
+    memcpy(node->mortons, mort_new, node->count * sizeof(uint64_t));
+    free(mort_new);
+
+    unsigned int offset = 0;
+    node->children = (t_tree **)calloc(8, sizeof(t_tree *));
+    for (int i = 0; i < 8; i++)
+    {
+        node->children[i] = (t_tree *)calloc(1, sizeof(t_tree));
+        node->children[i]->positions = &(node->positions[offset]);
+        node->children[i]->velocities = &(node->velocities[offset]);
+        node->children[i]->mortons = &(node->mortons[offset]);
+        node->children[i]->count = counts[i];
+        node->children[i]->parent = node;
+        node->children[i]->children = NULL;
+        node->children[i]->bounds = bounds_from_code(node->bounds, i);
+        offset += counts[i];
+    }
+    free(counts);
+    free(spots);
 }
 
 void split(t_tree *node)
@@ -713,7 +618,7 @@ void split_tree(t_tree *root)
         root->as_single = make_as_single(root);
         return;
     }
-    split(root);
+    new_split(root);
     for (int i = 0; i < 8; i++)
         split_tree(root->children[i]);
     root->as_single = make_as_single(root);
@@ -727,7 +632,7 @@ void *split_thread(void *param)
         root->as_single = make_as_single(root);
         return (0);
     }
-    split(root);
+    new_split(root);
     for (int i = 0; i < 8; i++)
         split_tree(root->children[i]);
     root->as_single = make_as_single(root);
@@ -737,7 +642,7 @@ void *split_thread(void *param)
 void mt_split_tree(t_tree *root)
 {
     pthread_t *split_threads = calloc(8, sizeof(pthread_t));
-    split(root);
+    new_split(root);
     for (int i = 0; i < 8; i++)
         pthread_create(&split_threads[i], NULL, split_thread, root->children[i]);
     for (int i = 0; i < 8; i++)
@@ -750,29 +655,16 @@ t_tree *make_tree(t_dataset *data)
 	//determine bounding cube of particle set
     t_bounds root_bounds = bounds_from_bodies(data->positions, data->particle_cnt);
 
-	//generate and cache morton codes for each body
-	t_sortbod *sorts = mt_make_sortbods(data, root_bounds);
-    printf("made sbods\n");
-	//sort the bodies by their morton codes
-	//they are now arranged on a z-order curve.
-    mort_tim_sort(sorts, data->particle_cnt);
-    printf("sorted\n");
-	//copy data back from cached sort structure //this should be multithreaded as well
     uint64_t *mortons = calloc(data->particle_cnt, sizeof(uint64_t));
     for (int i = 0; i < data->particle_cnt; i++)
-    {
-        data->positions[i] = sorts[i].pos;
-        data->velocities[i] = sorts[i].vel;
-        mortons[i] = sorts[i].morton;;
-    }
+        mortons[i] = mortonize(data->positions[i], root_bounds);
+    // ^^ could mthread this but meh for now ^^
     t_tree *root = new_tnode(data->positions, data->velocities, data->particle_cnt, NULL);
     root->bounds = root_bounds;
     root->mortons = mortons;
-    printf("transferred back from sbods\n");
     //recursively divide the tree
     mt_split_tree(root);
     printf("made tree\n");
-    free(sorts);
     free(mortons);
     return (root);
 }
@@ -797,7 +689,7 @@ static void free_tree(t_tree *t)
 
 void    divide_dataset(t_standalone *sim)
 {
-    printf("divide start, particle count %d\n", sim->dataset->particle_cnt);
+    printf("divide start, particle count %ld\n", sim->dataset->particle_cnt);
     static t_tree *t;
 
     if (t != NULL)
