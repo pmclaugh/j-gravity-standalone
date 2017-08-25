@@ -251,45 +251,6 @@ static t_tree **enumerate_better(t_tree *root)
     return ret;
 }
 
-static t_tree **enumerate_leaves(t_tree *root)
-{
-    //return a linear t_tree** that's all the leaf nodes (ie childless nodes) in the tree
-    //this is an excellent opportunity to very quickly do centers of gravity/as_single
-    t_tree **ret;
-
-    if (!root->children)
-    {
-        //root->as_single = make_as_single(root);
-        ret = (t_tree **)calloc(2, sizeof(t_tree *));
-        ret[0] = root->count ? root : NULL; //we do not bother enumerating empty leaves (empty cells cant have children so this covers all)
-        ret[1] = NULL;
-        return (ret);
-    }
-    t_tree ***returned = (t_tree ***)calloc(8, sizeof(t_tree **));
-    int total = 0;
-    for (int i = 0; i < 8; i++)
-    {
-        returned[i] = enumerate_leaves(root->children[i]);
-        total += count_tree_array(returned[i]);
-    }
-    //root->as_single = make_as_single(root);
-    ret = (t_tree **)calloc(total + 1, sizeof(t_tree *));
-    for (int i = 0; i < total;)
-    {
-        for (int j = 0; j < 8; j++)
-        {
-            for (int k = 0; returned[j][k]; k++, i++)
-            {
-                ret[i] = returned[j][k];
-            }
-            free(returned[j]);
-        }
-        free(returned);
-    }
-    ret[total] = NULL;
-    return (ret);
-}
-
 /*
     assemble neighborhood and related functions. This is where workunits are built.
 */
@@ -582,33 +543,6 @@ void new_split(t_tree *node)
     free(spots);
 }
 
-void split(t_tree *node)
-{
-	//split this cell into 8 octants
-    node->children = (t_tree **)calloc(8, sizeof(t_tree *));
-    int depth = node_depth(node);
-    unsigned int offset = 0;
-    //printf("this cell has %d bodies\n", node->count);
-    for (unsigned int i = 0; i < 8; i++)
-    {
-        node->children[i] = (t_tree *)calloc(1, sizeof(t_tree));
-        node->children[i]->positions = &(node->positions[offset]);
-        node->children[i]->velocities = &(node->velocities[offset]);
-        node->children[i]->mortons = &(node->mortons[offset]);
-        node->children[i]->count = 0;
-        node->children[i]->parent = node;
-        node->children[i]->children = NULL;
-        node->children[i]->bounds = bounds_from_code(node->bounds, i);
-		
-		//scan through array for borders between 3-bit substring values for this depth
-		//these are the dividing lines between octants
-        unsigned int j = binary_border_search(node->mortons, offset, node->count, i, depth);
-        offset += j;
-        node->children[i]->count = j;
-        //printf("child %d has %d bodies\n", i, j);
-    }
-}
-
 void split_tree(t_tree *root)
 {
 	//we divide the tree until each leaf cell has < leaf threshold bodies.
@@ -650,15 +584,51 @@ void mt_split_tree(t_tree *root)
     free(split_threads);
 }
 
+typedef struct s_mortkit
+{
+    cl_float4 *positions;
+    t_bounds bounds;
+    uint64_t *mortons;
+    int max;
+}               t_mortkit;
+
+void *mort_thread(void *param)
+{
+    t_mortkit *mk = (t_mortkit *)param;
+    for (int i = 0; i < mk->max; i++)
+        mk->mortons[i] = mortonize(mk->positions[i], mk->bounds);
+    free(mk);
+    return (0);
+}
+
+void mt_mort(cl_float4 *positions, int count, t_bounds bounds, uint64_t *mortons)
+{
+    int ppt = count / THREADCOUNT; //threadcount needs to be a power of 2
+    int offset = 0;
+    pthread_t *threads = calloc(THREADCOUNT, sizeof(pthread_t));
+    for (int i = 0; i < THREADCOUNT; i++)
+    {
+        t_mortkit *mk = calloc(1, sizeof(t_mortkit));
+        mk->positions = &(positions[offset]);
+        mk->mortons = &(mortons[offset]);
+        mk->bounds = bounds;
+        mk->max = ppt;
+        pthread_create(&threads[i], NULL, mort_thread, mk);
+        offset += ppt;
+    }
+    for (int i = 0; i < THREADCOUNT; i++)
+        pthread_join(threads[i], NULL);
+    free(threads);
+
+}
+
 t_tree *make_tree(t_dataset *data)
 {
 	//determine bounding cube of particle set
     t_bounds root_bounds = bounds_from_bodies(data->positions, data->particle_cnt);
 
     uint64_t *mortons = calloc(data->particle_cnt, sizeof(uint64_t));
-    for (int i = 0; i < data->particle_cnt; i++)
-        mortons[i] = mortonize(data->positions[i], root_bounds);
-    // ^^ could mthread this but meh for now ^^
+    mt_mort(data->positions, data->particle_cnt, root_bounds, mortons);
     t_tree *root = new_tnode(data->positions, data->velocities, data->particle_cnt, NULL);
     root->bounds = root_bounds;
     root->mortons = mortons;
